@@ -1,10 +1,4 @@
-"""High-level synchronization of Cloudflare lists and rules.
-
-``CloudflareManager`` reconciles the desired domain sets (block + allow) with
-the lists and rules that already exist on Cloudflare Gateway, using the local
-cache to avoid unnecessary API calls.
-"""
-
+"""High-level synchronization of Cloudflare lists and rules."""
 from __future__ import annotations
 
 from typing import Optional, Sequence
@@ -18,14 +12,18 @@ from .api import (
     update_list,
     update_rule,
 )
+from .compressor import compress, lists_needed, write_coverage_artifacts
 from .config import (
     ALLOW_PREFIX,
     BLOCK_PREFIX,
     DOMAINS_PER_LIST,
     ENABLE_SNI_FILTER,
+    MAX_REGEX_EXPR_CHARS,
+    MAX_REGEX_PER_RULE,
     MAX_TOTAL_LISTS,
+    REGEX_RULE_PREFIX,
 )
-from .http_client import NotFoundException
+from .http_client import HTTPException, NotFoundException
 from .log import fatal, info, warn
 from .sources import AllowDomainConverter, BlockDomainConverter
 
@@ -35,17 +33,15 @@ class CloudflareManager:
 
     def __init__(self, cache: state.Cache) -> None:
         self.cache = cache
-
         self.block_list_name = f"[{BLOCK_PREFIX}]"
         self.block_rule_name = f"[{BLOCK_PREFIX}] Block Ads"
         self.block_sni_rule_name = f"[{BLOCK_PREFIX}] Block Ads (SNI)"
-
         self.allow_list_name = f"[{ALLOW_PREFIX}]"
         self.allow_rule_name = f"[{ALLOW_PREFIX}] Allow"
+        self.allow_sni_rule_name = f"[{ALLOW_PREFIX}] Allow (SNI)"
+        self.regex_rule_prefix = f"[{REGEX_RULE_PREFIX}"
+        self.regex_sni_prefix = f"[{BLOCK_PREFIX}] Block Ads (SNI regex"
 
-    # ------------------------------------------------------------------
-    # Generic list/rule sync (shared by both block and allow)
-    # ------------------------------------------------------------------
     def _sync_rule(
         self,
         list_ids: Sequence[str],
@@ -54,66 +50,68 @@ class CloudflareManager:
         rule_priority: int,
         filters: Optional[Sequence[str]] = None,
         traffic_field: str = "dns.domains",
+        traffic: Optional[str] = None,
     ) -> None:
+        if not list_ids and not traffic:
+            info(f"[·] No lists/traffic for {rule_name} — deleting rule if present")
+            self._delete_rule_by_name(rule_name)
+            return
+
         current_rules = state.get_current_rules(self.cache, rule_name)
         existing_rule = next(
             (rule for rule in current_rules if rule["name"] == rule_name), None
         )
         existing_list_ids = state.extract_list_ids(existing_rule)
+        needs_update = True
+        if existing_rule and traffic is None:
+            needs_update = set(list_ids) != existing_list_ids
+        elif existing_rule and traffic is not None:
+            needs_update = (existing_rule.get("traffic") or "") != traffic
+
+        if existing_rule and not needs_update:
+            warn(f"[·] Skipping rule update (unchanged): {rule_name}")
+            return
+
+        kwargs = dict(
+            action=rule_action,
+            priority=rule_priority,
+            filters=filters,
+            traffic_field=traffic_field,
+        )
 
         if existing_rule:
-            if set(list_ids) != existing_list_ids:
-                try:
-                    updated = update_rule(
-                        rule_name,
-                        existing_rule["id"],
-                        list_ids,
-                        action=rule_action,
-                        priority=rule_priority,
-                        filters=filters,
-                        traffic_field=traffic_field,
-                    )
-                    info(f"[~] Updated rule: {updated['name']}")
-                    self.cache["rules"] = [
-                        rule
-                        for rule in self.cache["rules"]
-                        if rule["id"] != existing_rule["id"]
-                    ]
-                    self.cache["rules"].append(updated)
-                except NotFoundException:
-                    warn(
-                        f"[·] Rule {rule_name} ({existing_rule['id']}) missing on "
-                        f"Cloudflare — evicting from cache and recreating"
-                    )
-                    self.cache["rules"] = [
-                        rule
-                        for rule in self.cache["rules"]
-                        if rule["id"] != existing_rule["id"]
-                    ]
-                    rule = create_rule(
-                        rule_name,
-                        list_ids,
-                        action=rule_action,
-                        priority=rule_priority,
-                        filters=filters,
-                        traffic_field=traffic_field,
-                    )
-                    info(f"[+] Recreated rule: {rule['name']}")
-                    self.cache["rules"].append(rule)
-            else:
-                warn(f"[·] Skipping rule update (unchanged): {rule_name}")
+            try:
+                updated = update_rule(
+                    rule_name,
+                    existing_rule["id"],
+                    list_ids,
+                    traffic=traffic,
+                    **kwargs,
+                )
+                info(f"[~] Updated rule: {updated['name']}")
+                self.cache["rules"] = [
+                    rule
+                    for rule in self.cache["rules"]
+                    if rule["id"] != existing_rule["id"]
+                ]
+                self.cache["rules"].append(updated)
+            except NotFoundException:
+                warn(
+                    f"[·] Rule {rule_name} ({existing_rule['id']}) missing on "
+                    f"Cloudflare — evicting from cache and recreating"
+                )
+                self.cache["rules"] = [
+                    rule
+                    for rule in self.cache["rules"]
+                    if rule["id"] != existing_rule["id"]
+                ]
+                rule = create_rule(rule_name, list_ids, traffic=traffic, **kwargs)
+                info(f"[+] Recreated rule: {rule['name']}")
+                self.cache["rules"].append(rule)
         else:
-            rule = create_rule(
-                rule_name,
-                list_ids,
-                action=rule_action,
-                priority=rule_priority,
-                filters=filters,
-                traffic_field=traffic_field,
-            )
+            rule = create_rule(rule_name, list_ids, traffic=traffic, **kwargs)
             info(f"[+] Created rule: {rule['name']}")
             self.cache["rules"].append(rule)
-
         state.save_cache(self.cache)
 
     def _delete_rule_by_name(self, rule_name: str) -> None:
@@ -129,11 +127,23 @@ class CloudflareManager:
             ]
             state.save_cache(self.cache)
 
-    def _delete_by_prefix(self, list_name_prefix: str, rule_name: str) -> None:
-        # 1. Delete the corresponding rule.
-        self._delete_rule_by_name(rule_name)
+    def _delete_rules_by_prefix(self, prefix: str) -> None:
+        current_rules = state.get_current_rules(self.cache, prefix)
+        for rule in current_rules:
+            if not rule["name"].startswith(prefix) and prefix not in rule["name"]:
+                continue
+            try:
+                delete_rule(rule["id"])
+                info(f"[−] Deleted rule: {rule['name']}")
+            except NotFoundException:
+                warn(f"[·] Rule {rule['name']} already gone — skipping")
+            self.cache["rules"] = [
+                item for item in self.cache["rules"] if item["id"] != rule["id"]
+            ]
+        state.save_cache(self.cache)
 
-        # 2. Delete each list matching the prefix individually.
+    def _delete_by_prefix(self, list_name_prefix: str, rule_name: str) -> None:
+        self._delete_rule_by_name(rule_name)
         current_lists = state.get_current_lists(self.cache, list_name_prefix)
         for lst in current_lists:
             try:
@@ -141,13 +151,77 @@ class CloudflareManager:
                 info(f"[−] Deleted list: {lst['name']}")
             except NotFoundException:
                 warn(f"[·] List {lst['name']} already gone on Cloudflare — skipping")
-
             self.cache["lists"] = [
                 item for item in self.cache.get("lists", []) if item["id"] != lst["id"]
             ]
             self.cache.get("mapping", {}).pop(lst["id"], None)
             state.save_cache(self.cache)
+        state.save_cache(self.cache)
 
+    def _chunk_regex(self, patterns: Sequence[str], field: str) -> list[str]:
+        chunks: list[list[str]] = []
+        current: list[str] = []
+        size = 0
+        for pat in patterns:
+            clause = f'{field} matches "{pat}"'
+            extra = len(clause) + (4 if current else 0)
+            if current and (
+                len(current) >= MAX_REGEX_PER_RULE
+                or size + extra > MAX_REGEX_EXPR_CHARS
+            ):
+                chunks.append(current)
+                current = []
+                size = 0
+            current.append(pat)
+            size += extra
+        if current:
+            chunks.append(current)
+        return [
+            " or ".join(f'{field} matches "{p}"' for p in chunk) for chunk in chunks
+        ]
+
+    def _sync_regex_rules(
+        self,
+        patterns: Sequence[str],
+        name_prefix: str,
+        field: str,
+        priority: int,
+        filters: Optional[Sequence[str]] = None,
+    ) -> None:
+        expressions = self._chunk_regex(patterns, field) if patterns else []
+        # Drop stale regex rules whose index is beyond the new set.
+        existing = [
+            r
+            for r in self.cache.get("rules", [])
+            if r.get("name", "").startswith(name_prefix)
+        ]
+        keep_names = {f"{name_prefix} {i:03d}" for i in range(1, len(expressions) + 1)}
+        for rule in existing:
+            if rule["name"] not in keep_names:
+                try:
+                    delete_rule(rule["id"])
+                    info(f"[−] Deleted stale regex rule: {rule['name']}")
+                except NotFoundException:
+                    pass
+                self.cache["rules"] = [
+                    item for item in self.cache["rules"] if item["id"] != rule["id"]
+                ]
+        for index, expr in enumerate(expressions, start=1):
+            try:
+                self._sync_rule(
+                    [],
+                    f"{name_prefix} {index:03d}",
+                    rule_action="block",
+                    rule_priority=priority,
+                    filters=filters,
+                    traffic_field=field,
+                    traffic=expr,
+                )
+            except (HTTPException, ValueError) as exc:
+                warn(
+                    f"Regex rule {name_prefix} {index:03d} rejected by Cloudflare "
+                    f"({exc}). Lists still stand; this pattern was skipped."
+                )
         state.save_cache(self.cache)
 
     def _sync_lists(
@@ -159,7 +233,6 @@ class CloudflareManager:
         rule_priority: int,
         sni_rule_name: Optional[str] = None,
     ) -> list[str]:
-        # --- Fast path: skip the entire sync when the domain set is unchanged ---
         cached_hash, cached_domains = state.get_cached_domain_state(
             self.cache, list_name_prefix
         )
@@ -170,9 +243,19 @@ class CloudflareManager:
                 f"({len(domains)} domains) — skipping all lists"
             )
             current_lists = state.get_current_lists(self.cache, list_name_prefix)
-            return [lst["id"] for lst in current_lists]
+            list_ids = [lst["id"] for lst in current_lists]
+            self._sync_rule(list_ids, rule_name, rule_action, rule_priority)
+            if sni_rule_name:
+                self._sync_rule(
+                    list_ids,
+                    sni_rule_name,
+                    rule_action,
+                    rule_priority,
+                    filters=["l4"],
+                    traffic_field="net.sni.domains",
+                )
+            return list_ids
 
-        # --- Domains changed: compute diff ---
         to_add, to_remove = state.get_domain_diff(domains, cached_domains)
         if cached_hash is None:
             info(f"[+] First sync for {list_name_prefix} — creating {len(domains)} domains")
@@ -181,14 +264,11 @@ class CloudflareManager:
                 f"[⟳] {list_name_prefix} changed: "
                 f"+{len(to_add)} / -{len(to_remove)} domains"
             )
-
         state.set_cached_domain_state(self.cache, list_name_prefix, domains)
         state.save_cache(self.cache)
 
         current_lists = state.get_current_lists(self.cache, list_name_prefix)
         list_name_to_id = {lst["name"]: lst["id"] for lst in current_lists}
-
-        # --- Choose sync strategy ---
         reverse_map = state.get_cached_reverse_mapping(self.cache, list_name_prefix)
         if reverse_map:
             info(
@@ -204,16 +284,12 @@ class CloudflareManager:
                 domains, current_lists, list_name_to_id, list_name_prefix
             )
 
-        # Rebuild the reverse mapping from the updated forward mapping.
         new_reverse = state.build_reverse_mapping(
             self.cache, new_list_ids, list_name_prefix
         )
         state.set_cached_reverse_mapping(self.cache, list_name_prefix, new_reverse)
 
-        # Sync the DNS rule.
         self._sync_rule(new_list_ids, rule_name, rule_action, rule_priority)
-
-        # Optional SNI (L4) rule.
         if sni_rule_name:
             self._sync_rule(
                 new_list_ids,
@@ -223,13 +299,9 @@ class CloudflareManager:
                 filters=["l4"],
                 traffic_field="net.sni.domains",
             )
-
         state.save_cache(self.cache)
         return new_list_ids
 
-    # ------------------------------------------------------------------
-    # Surgical sync: uses the reverse mapping to only touch affected lists
-    # ------------------------------------------------------------------
     def _sync_lists_surgical(
         self,
         domains: Sequence[str],
@@ -239,23 +311,18 @@ class CloudflareManager:
         reverse_map: dict[str, str],
         list_name_prefix: str,
     ) -> list[str]:
-        # Build per-list remove sets via the reverse mapping.
         list_removes: dict[str, set[str]] = {}
         for domain in to_remove:
             list_id = reverse_map.get(domain)
             if list_id is not None:
                 list_removes.setdefault(list_id, set()).add(domain)
-
         remaining_add = list(to_add)
         new_list_ids: list[str] = []
-
         for lst in current_lists:
             list_id = lst["id"]
             removes = list_removes.get(list_id, set())
-
             current_values = set(self.cache.get("mapping", {}).get(list_id, []))
             chunk = current_values - removes
-
             if not chunk:
                 try:
                     delete_list(list_id)
@@ -268,15 +335,12 @@ class CloudflareManager:
                 self.cache["mapping"].pop(list_id, None)
                 state.save_cache(self.cache)
                 continue
-
-            # Fill freed space (and any existing room) with new domains.
             new_items: list[str] = []
             if len(chunk) < DOMAINS_PER_LIST and remaining_add:
                 needed_items = DOMAINS_PER_LIST - len(chunk)
                 new_items = remaining_add[:needed_items]
                 remaining_add = remaining_add[needed_items:]
                 chunk.update(new_items)
-
             if removes or new_items:
                 try:
                     update_list(list_id, removes, set(new_items))
@@ -303,10 +367,8 @@ class CloudflareManager:
                 state.save_cache(self.cache)
             else:
                 warn(f"[·] Skipped (no changes): {lst['name']} | Total: {len(chunk)}")
-
             new_list_ids.append(list_id)
 
-        # Fill remaining new domains into lists that still have space.
         for list_id in list(new_list_ids):
             if not remaining_add:
                 break
@@ -328,7 +390,6 @@ class CloudflareManager:
                 warn(f"[·] List {list_id} missing — skipping fill")
             state.save_cache(self.cache)
 
-        # Create new lists for leftover domains.
         existing_indexes = []
         for lst in current_lists:
             try:
@@ -336,7 +397,6 @@ class CloudflareManager:
             except (ValueError, IndexError):
                 pass
         next_index = max(existing_indexes + [0]) + 1
-
         while remaining_add:
             needed_items = min(DOMAINS_PER_LIST, len(remaining_add))
             new_items = remaining_add[:needed_items]
@@ -349,12 +409,8 @@ class CloudflareManager:
             state.save_cache(self.cache)
             new_list_ids.append(created["id"])
             next_index += 1
-
         return new_list_ids
 
-    # ------------------------------------------------------------------
-    # Full sync: loads items from every list (fallback for the first run)
-    # ------------------------------------------------------------------
     def _sync_lists_full(
         self,
         domains: Sequence[str],
@@ -367,20 +423,17 @@ class CloudflareManager:
             list_id_to_domains[lst["id"]] = set(
                 state.get_list_items_cached(self.cache, lst["id"])
             )
-
         domain_to_list_id = {
             domain: list_id
             for list_id, doms in list_id_to_domains.items()
             for domain in doms
         }
-
         remaining_domains = set(domains) - set(domain_to_list_id.keys())
         existing_indexes = sorted(
             [int(name.split("-")[-1]) for name in list_name_to_id.keys()]
         )
         needed_lists = (len(domains) + DOMAINS_PER_LIST - 1) // DOMAINS_PER_LIST
         all_indexes = set(range(1, max(existing_indexes + [needed_lists]) + 1))
-
         new_list_ids: list[str] = []
         for index in sorted(all_indexes):
             list_name = f"{list_name_prefix} - {index:03d}"
@@ -399,19 +452,16 @@ class CloudflareManager:
                     state.save_cache(self.cache)
                     new_list_ids.append(created["id"])
                 continue
-
             list_id = list_name_to_id[list_name]
             current_values = list_id_to_domains[list_id]
             remove_items = current_values - set(domains)
             chunk = current_values - remove_items
-
             new_items: list[str] = []
             if len(chunk) < DOMAINS_PER_LIST and remaining_domains:
                 needed_items = DOMAINS_PER_LIST - len(chunk)
                 new_items = list(remaining_domains)[:needed_items]
                 chunk.update(new_items)
                 remaining_domains.difference_update(new_items)
-
             if not chunk:
                 try:
                     delete_list(list_id)
@@ -424,7 +474,6 @@ class CloudflareManager:
                 self.cache["mapping"].pop(list_id, None)
                 state.save_cache(self.cache)
                 continue
-
             if remove_items or new_items:
                 try:
                     update_list(list_id, remove_items, new_items)
@@ -454,34 +503,46 @@ class CloudflareManager:
                 state.save_cache(self.cache)
             else:
                 warn(f"[·] Skipped (no changes): {list_name} | Total: {len(chunk)}")
-
             new_list_ids.append(list_id)
-
         return new_list_ids
 
     def update_resources(self) -> None:
         info("=== [1/2] Processing BLOCK domains ===")
         block_converter = BlockDomainConverter()
         domains_to_block = block_converter.process_urls()
-
         info("=== [2/2] Processing ALLOW domains ===")
-        # Promote AdBlock/uBlock exception rules from the block sources,
-        # e.g. @@||drive.quark.cn^, into the dedicated Cloudflare Allow list.
         domains_to_allow = AllowDomainConverter().process_urls(
             extra_domains=block_converter.auto_whitelist_domains
         )
 
-        # --- Guard: total lists must not exceed the free tier limit ---
-        block_lists_needed = (len(domains_to_block) + DOMAINS_PER_LIST - 1) // DOMAINS_PER_LIST
-        allow_lists_needed = (len(domains_to_allow) + DOMAINS_PER_LIST - 1) // DOMAINS_PER_LIST
-        total_lists_needed = block_lists_needed + allow_lists_needed
+        info("=== Compressing to Cloudflare DOMAIN quota ===")
+        domains_to_block, regex_patterns, stats, uncovered = compress(
+            domains_to_block,
+            domains_to_allow,
+            priority_domains=block_converter.priority_domains,
+            secondary_domains=block_converter.secondary_domains,
+        )
+        # Source-file regex (Pi-hole / uBlock) is often PCRE, not RE2.
+        # Uploading it will 400 the Gateway rule and abort the job. Keep it
+        # off the wire; synthesized patterns are RE2-safe by construction.
+        if block_converter.regex_patterns:
+            info(
+                f"Ignoring {len(block_converter.regex_patterns)} source regex "
+                f"line(s) (PCRE). Using {len(regex_patterns)} synthesized RE2 "
+                f"pattern(s) only."
+            )
+        write_coverage_artifacts(stats, uncovered)
+        info(f"Compressor stats: {stats}")
 
+        block_lists_needed = lists_needed(len(domains_to_block))
+        allow_lists_needed = lists_needed(len(domains_to_allow))
+        total_lists_needed = block_lists_needed + allow_lists_needed
         info(
             f"Lists needed → Block: {block_lists_needed}, "
             f"Allow: {allow_lists_needed}, "
-            f"Total: {total_lists_needed} / {MAX_TOTAL_LISTS}"
+            f"Total: {total_lists_needed} / {MAX_TOTAL_LISTS}; "
+            f"regex patterns: {len(regex_patterns)}"
         )
-
         if total_lists_needed > MAX_TOTAL_LISTS:
             fatal(
                 f"Total lists needed ({total_lists_needed}) exceeds the "
@@ -498,21 +559,48 @@ class CloudflareManager:
             rule_priority=1000,
             sni_rule_name=self.block_sni_rule_name if ENABLE_SNI_FILTER else None,
         )
-
         info("=== Syncing ALLOW lists & rule ===")
         self._sync_lists(
             domains_to_allow,
             self.allow_list_name,
             self.allow_rule_name,
             rule_action="allow",
-            rule_priority=999,  # Lower number = evaluated first → allow wins
+            rule_priority=999,
+            sni_rule_name=self.allow_sni_rule_name if ENABLE_SNI_FILTER else None,
         )
-
+        info("=== Syncing supplemental REGEX rules ===")
+        self._sync_regex_rules(
+            regex_patterns,
+            f"[{BLOCK_PREFIX}] Block Ads (regex)",
+            field="dns.fqdn",
+            priority=1000,
+        )
+        if ENABLE_SNI_FILTER:
+            self._sync_regex_rules(
+                regex_patterns,
+                f"[{BLOCK_PREFIX}] Block Ads (SNI regex)",
+                field="net.sni",
+                priority=1000,
+                filters=["l4"],
+            )
+        else:
+            self._sync_regex_rules(
+                [],
+                f"[{BLOCK_PREFIX}] Block Ads (SNI regex)",
+                field="net.sni",
+                priority=1000,
+                filters=["l4"],
+            )
         info("=== Done ===")
 
     def delete_resources(self) -> None:
         info("=== Deleting BLOCK resources ===")
         self._delete_rule_by_name(self.block_sni_rule_name)
+        self._delete_rule_by_name(self.allow_sni_rule_name)
+        self._sync_regex_rules([], f"[{BLOCK_PREFIX}] Block Ads (regex)", "dns.fqdn", 1000)
+        self._sync_regex_rules(
+            [], f"[{BLOCK_PREFIX}] Block Ads (SNI regex)", "net.sni", 1000, ["l4"]
+        )
         self._delete_by_prefix(self.block_list_name, self.block_rule_name)
         info("=== Deleting ALLOW resources ===")
         self._delete_by_prefix(self.allow_list_name, self.allow_rule_name)

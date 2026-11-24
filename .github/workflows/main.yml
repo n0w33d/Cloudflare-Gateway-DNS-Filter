@@ -2,47 +2,52 @@ name: Cloudflare Gateway DNS Filter (Block + Allow)
 
 on:
   push:
-  # schedule:
-  #   - cron: "0 0 * * 5"   # Every Friday midnight UTC
+  schedule:
+    - cron: "0 6 1 * *"   # 06:00 UTC on the 1st of every month
   workflow_dispatch:
 
 jobs:
   run:
     name: Sync Block & Allow Lists
-    permissions: write-all
+    permissions:
+      contents: read
+      actions: write
     runs-on: ubuntu-latest
-    timeout-minutes: 30
-
+    timeout-minutes: 60
     env:
       GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       CF_API_TOKEN: ${{ secrets.CF_API_TOKEN }}
       CF_IDENTIFIER: ${{ secrets.CF_IDENTIFIER }}
-      # Block sources
       ADLIST_URLS: ${{ vars.ADLIST_URLS }}
       DYNAMIC_BLACKLIST: ${{ vars.DYNAMIC_BLACKLIST }}
-      # Allow sources
       WHITELIST_URLS: ${{ vars.WHITELIST_URLS }}
       DYNAMIC_WHITELIST: ${{ vars.DYNAMIC_WHITELIST }}
-
+      ENABLE_SNI_FILTER: ${{ vars.ENABLE_SNI_FILTER }}
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@main
+        uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
       - name: Install Python
-        uses: actions/setup-python@main
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-
       - name: Cache Cloudflare state
         id: cache-cloudflare
-        uses: actions/cache@main
+        uses: actions/cache@v4
         with:
           path: cloudflare_cache.json
-          key: ${{ runner.os }}-cloudflare-cache-${{ github.run_id }}
+          key: ${{ runner.os }}-cloudflare-cache-${{ hashFiles('lists/**', 'cloudflare_gateway/**') }}
           restore-keys: |
             ${{ runner.os }}-cloudflare-cache-
-
       - name: Run — Sync Block & Allow to Cloudflare Gateway
         run: python -m cloudflare_gateway run
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gateway-coverage
+          path: |
+            coverage_report.json
+            uncovered.txt
+          if-no-files-found: ignore

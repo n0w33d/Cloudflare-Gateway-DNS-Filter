@@ -1,12 +1,11 @@
 """Thin wrapper around the Cloudflare Gateway lists and rules endpoints."""
-
 from __future__ import annotations
 
 import json
 from typing import Optional, Sequence
 
 from .http_client import (
-    RateLimitException,  # noqa: F401  (re-exported for callers)
+    RateLimitException,  # noqa: F401
     cloudflare_gateway_request,
     rate_limited_request,
     retry,
@@ -19,6 +18,8 @@ API_DESCRIPTION = "Managed by Cloudflare-Gateway-DNS-Filter"
 @retry(**retry_config)
 @rate_limited_request
 def create_list(name: str, domains: Sequence[str]) -> dict:
+    if not domains:
+        raise ValueError(f"Refusing to create empty list: {name}")
     endpoint = "/lists"
     data = {
         "name": name,
@@ -55,13 +56,24 @@ def _rule_payload(
     priority: int,
     filters: Optional[Sequence[str]],
     traffic_field: str,
+    traffic: Optional[str] = None,
 ) -> dict:
+    if traffic:
+        expr = traffic
+    else:
+        if not list_ids:
+            raise ValueError(
+                f"Refusing to create/update rule {rule_name!r} with no lists"
+            )
+        expr = " or ".join(
+            f"any({traffic_field}[*] in ${lst})" for lst in list_ids
+        )
     payload = {
         "name": rule_name,
         "description": f"{API_DESCRIPTION} ({action})",
         "action": action,
         "precedence": priority,
-        "traffic": " or ".join(f"any({traffic_field}[*] in ${lst})" for lst in list_ids),
+        "traffic": expr,
         "enabled": True,
     }
     if filters:
@@ -77,8 +89,11 @@ def create_rule(
     priority: int = 1000,
     filters: Optional[Sequence[str]] = None,
     traffic_field: str = "dns.domains",
+    traffic: Optional[str] = None,
 ) -> dict:
-    data = _rule_payload(rule_name, list_ids, action, priority, filters, traffic_field)
+    data = _rule_payload(
+        rule_name, list_ids, action, priority, filters, traffic_field, traffic
+    )
     _, response = cloudflare_gateway_request(
         "POST", "/rules", body=json.dumps(data)
     )
@@ -94,8 +109,11 @@ def update_rule(
     priority: int = 1000,
     filters: Optional[Sequence[str]] = None,
     traffic_field: str = "dns.domains",
+    traffic: Optional[str] = None,
 ) -> dict:
-    data = _rule_payload(rule_name, list_ids, action, priority, filters, traffic_field)
+    data = _rule_payload(
+        rule_name, list_ids, action, priority, filters, traffic_field, traffic
+    )
     endpoint = f"/rules/{rule_id}"
     _, response = cloudflare_gateway_request("PUT", endpoint, body=json.dumps(data))
     return response["result"]

@@ -1,0 +1,35 @@
+# Extra DNS (and SNI, if enabled) ALLOW regexes. These are NOT DOMAIN list
+# entries — Cloudflare has no "allow all .mil" list type.
+# Add each line as a Gateway DNS Allow policy:
+#   dns.fqdn matches "<pattern>"
+# and if ENABLE_SNI_FILTER=true, a Network Allow:
+#   net.sni matches "<pattern>"
+# Precedence: 998 (higher than Allow-lists 999 and Block 1000).
+#
+# Rust/RE2. Keep this file tiny. Do not dump millions of hosts here.
+
+# US government and DoD hostnames
+(^|\.)gov$
+(^|\.)mil$
+(^|\.)fed\.us$
+
+# DoD / USGov Azure + Microsoft 365 GCC / GCC High / DoD clouds
+(^|\.)microsoftonline\.us$
+(^|\.)microsoft\.us$
+(^|\.)azure\.us$
+(^|\.)office365\.us$
+(^|\.)graph\.microsoft\.us$
+(^|\.)windows\.net$
+
+# Steam content / P2P relay hostnames that rotate
+(^|\.)steamserver\.net$
+(^|\.)steamcontent\.com$
+(^|\.)steampowered\.com$
+
+# PlayStation patch CDNs
+(^|\.)playstation\.net$
+(^|\.)playstation\.com$
+
+# Nintendo eShop / account
+(^|\.)nintendo\.net$
+(^|\.)nintendo\.com$
